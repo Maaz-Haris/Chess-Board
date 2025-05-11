@@ -1,0 +1,139 @@
+
+module top_module (
+    input wire clk,              // System clock (e.g., 100 MHz)
+    input wire rst,              // Active-high reset
+    input wire white_turn,       // 1 for white's turn, 0 for black's turn
+    input wire [7:0] col_in,     // Column inputs from sensors (active-low)
+    output wire [2:0] row_addr,  // 3-bit row address for external decoder
+    output wire row_addr_en,     // Row address enable signal (active-low)
+    output wire [255:0] piece_values, // Encoded chess piece values (4-bit signed per square)
+    output wire move_executed,   // Pulses high when a valid move is executed
+    output wire invalid_move,    // High when an invalid move is detected
+    output wire [2:0] start_row, // Starting row of the move
+    output wire [2:0] start_col, // Starting column of the move
+    output wire [2:0] end_row,   // Ending row of the move
+    output wire [2:0] end_col,   // Ending column of the move
+    output wire [3:0] lifted_piece // Piece being moved
+);
+
+    // Internal wires from top_module_initial
+    wire [63:0] sensor_state;          // Sensor state from top_module_initial
+    wire [255:0] initial_piece_values; // Piece values from top_module_initial
+    wire [63:0] prev_sensor_state;     // Previous sensor state for piece_identifier
+    wire [255:0] new_board;            // Updated board from piece_identifier
+    wire move_exec_internal;           // Move executed signal from piece_identifier
+    wire invalid_move_internal;        // Invalid move signal from piece_identifier
+    wire [2:0] start_row_int, start_col_int; // Start position from piece_identifier
+    wire [2:0] end_row_int, end_col_int;     // End position from piece_identifier
+    wire [3:0] lifted_piece_int;             // Lifted piece from piece_identifier
+
+    // State machine states
+    localparam CHECK_INITIAL = 1'b0;
+    localparam PROCESS_MOVES = 1'b1;
+
+    // Registers
+    reg state;                         // Current state (CHECK_INITIAL or PROCESS_MOVES)
+    reg [255:0] current_board;         // Current board state
+    reg [63:0] sensor_state_reg;       // Registered sensor state for prev_sensor_state
+    reg move_executed_reg;             // Registered move executed signal
+    reg invalid_move_reg;              // Registered invalid move signal
+    reg [2:0] start_row_reg, start_col_reg; // Registered start position
+    reg [2:0] end_row_reg, end_col_reg;     // Registered end position
+    reg [3:0] lifted_piece_reg;             // Registered lifted piece
+
+    // Expected initial sensor state for standard chess position
+    // Rows 0-1: Black pieces (16 bits set), Rows 6-7: White pieces (16 bits set)
+    wire [63:0] expected_initial_state = 64'hFFFF00000000FFFF;
+
+    // Instantiate top_module_initial
+    top_module_initial initial_module (
+        .clk(clk),
+        .rst(rst),
+        .col_in(col_in),
+        .row_addr(row_addr),
+        .row_addr_en(row_addr_en),
+        .piece_values(initial_piece_values),
+        .sensor_state(sensor_state)
+    );
+
+    // Instantiate piece_identifier
+    piece_identifier identifier (
+        .clk(clk),
+        .rst(rst),
+        .white_turn(white_turn),
+        .sensor_state(sensor_state),
+        .prev_sensor_state(prev_sensor_state),
+        .board(current_board),
+        .new_board(new_board),
+        .move_executed(move_exec_internal),
+        .invalid_move(invalid_move_internal),
+        .start_row(start_row_int),
+        .start_col(start_col_int),
+        .end_row(end_row_int),
+        .end_col(end_col_int),
+        .lifted_piece(lifted_piece_int)
+    );
+
+    // Register previous sensor state
+    assign prev_sensor_state = sensor_state_reg;
+
+    // Output assignments
+    assign piece_values = current_board;
+    assign move_executed = move_executed_reg;
+    assign invalid_move = invalid_move_reg;
+    assign start_row = start_row_reg;
+    assign start_col = start_col_reg;
+    assign end_row = end_row_reg;
+    assign end_col = end_col_reg;
+    assign lifted_piece = lifted_piece_reg;
+
+    // State machine and logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= CHECK_INITIAL;
+            current_board <= 256'b0;
+            sensor_state_reg <= 64'b0;
+            move_executed_reg <= 1'b0;
+            invalid_move_reg <= 1'b0;
+            start_row_reg <= 3'b0;
+            start_col_reg <= 3'b0;
+            end_row_reg <= 3'b0;
+            end_col_reg <= 3'b0;
+            lifted_piece_reg <= 4'b0;
+        end else begin
+            // Update previous sensor state
+            sensor_state_reg <= sensor_state;
+
+            // Default outputs
+            move_executed_reg <= 1'b0;
+            invalid_move_reg <= invalid_move_internal;
+            start_row_reg <= start_row_int;
+            start_col_reg <= start_col_int;
+            end_row_reg <= end_row_int;
+            end_col_reg <= end_col_int;
+            lifted_piece_reg <= lifted_piece_int;
+
+            case (state)
+                CHECK_INITIAL: begin
+                    // Check if sensor state matches initial chess position
+                    if (sensor_state == expected_initial_state) begin
+                        current_board <= initial_piece_values; // Set board to initial position
+                        state <= PROCESS_MOVES; // Move to move processing
+                    end else begin
+                        current_board <= 256'b0; // Clear board until valid
+                        invalid_move_reg <= 1'b1; // Signal invalid until correct
+                    end
+                end
+
+                PROCESS_MOVES: begin
+                    // Update board on valid move
+                    if (move_exec_internal) begin
+                        current_board <= new_board; // Update board with new move
+                        move_executed_reg <= 1'b1; // Pulse move executed
+                    end
+                end
+            endcase
+        end
+    end
+
+endmodule
