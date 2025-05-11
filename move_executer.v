@@ -1,480 +1,472 @@
-module move_executor (
-    input wire clk,
-    input wire rst,
-    input wire [63:0] sensor_state,
-    input wire [255:0] board_flat_in,
-    output reg [255:0] board_flat_out,
-    output reg move_valid,
-    output reg next_turn
+module piece_identifier(
+    input wire clk,                         // System clock
+    input wire rst,                         // Reset signal
+    input wire white_turn,                  // 1 for white's turn, 0 for black's turn
+    input wire [63:0] sensor_state,         // Current sensor readings (1 = piece, 0 = no piece, flattened)
+    input wire [63:0] prev_sensor_state,    // Previous sensor readings (flattened)
+    input wire [255:0] board,               // Current board state (flattened, 64 x 4-bit segments)
+    output reg [255:0] new_board,           // Updated board after a valid move (flattened, 64 x 4-bit segments)
+    output reg move_executed,               // Pulses high when a valid move is executed
+    output reg invalid_move,                // High when an invalid move is detected until corrected
+    output reg [2:0] start_row, start_col,  // Starting position of the move
+    output reg [2:0] end_row, end_col,      // Ending position of the move
+    output reg [3:0] lifted_piece           // Piece being moved
 );
 
-    // Unpacked arrays for internal use
-    reg [3:0] board_in [0:63];
-    reg [3:0] board_out [0:63];
-    reg [5:0] moves [0:55];
+    // Parameters for piece representation
+    localparam EMPTY = 4'h0;
+    localparam W_PAWN = 4'h1;
+    localparam W_KING = 4'h2;
+    localparam W_QUEEN = 4'h3;
+    localparam W_ROOK = 4'h4;
+    localparam W_KNIGHT = 4'h5;
+    localparam W_BISHOP = 4'h6;
+    localparam B_PAWN = 4'hF;   // -1 in 4-bit 2's complement
+    localparam B_KING = 4'hE;   // -2 in 4-bit 2's complement
+    localparam B_QUEEN = 4'hD;  // -3 in 4-bit 2's complement
+    localparam B_ROOK = 4'hC;   // -4 in 4-bit 2's complement
+    localparam B_KNIGHT = 4'hB; // -5 in 4-bit 2's complement
+    localparam B_BISHOP = 4'hA; // -6 in 4-bit 2's complement
 
-    // Piece parameters
-    parameter EMPTY = 4'd0;
-    parameter W_PAWN = 4'd1;
-    parameter W_KING = 4'd2;
-    parameter W_QUEEN = 4'd3;
-    parameter W_ROOK = 4'd4;
-    parameter W_KNIGHT = 4'd5;
-    parameter W_BISHOP = 4'd6;
-    parameter B_PAWN = 4'd15;
-    parameter B_KING = 4'd14;
-    parameter B_QUEEN = 4'd13;
-    parameter B_ROOK = 4'd12;
-    parameter B_KNIGHT = 4'd11;
-    parameter B_BISHOP = 4'd10;
+    // State machine states
+    localparam IDLE = 3'b000;
+    localparam DETECT_LIFT = 3'b001;
+    localparam DETECT_LIFT_SCAN = 3'b010;
+    localparam WAIT_PLACEMENT = 3'b011;
+    localparam WAIT_PLACEMENT_SCAN = 3'b100;
+    localparam VALIDATE_MOVE = 3'b101;
+    localparam INVALID_WAIT = 3'b110;
 
-    // FSM states
-    localparam IDLE = 2'd0;
-    localparam LIFTED = 2'd1;
-    localparam PLACED = 2'd2;
-    localparam UPDATE = 2'd3;
+    // Internal registers
+    reg [2:0] state;                    // Current state
+    reg [2:0] orig_row, orig_col;       // Original position of lifted piece
+    reg move_in_progress;               // Tracks if a valid move is being processed
+    reg valid_move;                     // For VALIDATE_MOVE state
+    reg [5:0] scan_idx;                 // Index for scanning in DETECT_LIFT, WAIT_PLACEMENT
+    reg [5:0] i;                        // Index for board position (fixes "i is not declared" error)
 
-    // Internal signals
-    reg [1:0] state, next_state;
-    reg [63:0] prev_sensor_state;
-    reg [5:0] input_row, input_col, target_row, target_col;
-    reg [3:0] lifted_piece;
-    reg is_white_piece;
-    reg is_white_turn;
-    reg [5:0] move_count;
-    reg promotion_detected;
-    integer i, d, step;
-    
-    // Declare loop counter variables at the top level for use in all blocks
-    integer r, c;
-    
-    // Variables used in LIFTED state
-    reg [5:0] row, col, new_row, new_col;
-    reg [3:0] piece, target_piece;
-    reg is_white;
-
-    // Direction arrays
-    reg signed [5:0] directions [0:7][0:1];
-    reg signed [5:0] knight_moves [0:7][0:1];
-    reg signed [5:0] king_moves [0:7][0:1];
-
-    // Helper function to convert 2D coordinates to flattened index
-    function [5:0] get_flat_index;
-        input [5:0] r;
-        input [5:0] c;
-        begin
-            get_flat_index = (r * 8) + c;
-        end
-    endfunction
-
-    // Initialize direction arrays
+    // Initialize
     initial begin
-        directions[0][0] = 1;  directions[0][1] = 0;
-        directions[1][0] = -1; directions[1][1] = 0;
-        directions[2][0] = 0;  directions[2][1] = 1;
-        directions[3][0] = 0;  directions[3][1] = -1;
-        directions[4][0] = 1;  directions[4][1] = 1;
-        directions[5][0] = 1;  directions[5][1] = -1;
-        directions[6][0] = -1; directions[6][1] = 1;
-        directions[7][0] = -1; directions[7][1] = -1;
-
-        knight_moves[0][0] = 2;  knight_moves[0][1] = 1;
-        knight_moves[1][0] = 1;  knight_moves[1][1] = 2;
-        knight_moves[2][0] = -1; knight_moves[2][1] = 2;
-        knight_moves[3][0] = -2; knight_moves[3][1] = 1;
-        knight_moves[4][0] = -2; knight_moves[4][1] = -1;
-        knight_moves[5][0] = -1; knight_moves[5][1] = -2;
-        knight_moves[6][0] = 1;  knight_moves[6][1] = -2;
-        knight_moves[7][0] = 2;  knight_moves[7][1] = -1;
-
-        king_moves[0][0] = 1;  king_moves[0][1] = 0;
-        king_moves[1][0] = -1; king_moves[1][1] = 0;
-        king_moves[2][0] = 0;  king_moves[2][1] = 1;
-        king_moves[3][0] = 0;  king_moves[3][1] = -1;
-        king_moves[4][0] = 1;  king_moves[4][1] = 1;
-        king_moves[5][0] = 1;  king_moves[5][1] = -1;
-        king_moves[6][0] = -1; king_moves[6][1] = 1;
-        king_moves[7][0] = -1; king_moves[7][1] = -1;
+        state = IDLE;
+        move_executed = 0;
+        invalid_move = 0;
+        move_in_progress = 0;
+        lifted_piece = EMPTY;
+        start_row = 0;
+        start_col = 0;
+        end_row = 0;
+        end_col = 0;
+        orig_row = 0;
+        orig_col = 0;
+        new_board = 256'h0; // Initialize all 256 bits to 0 (EMPTY)
+        i = 0;
+        scan_idx = 0;
     end
 
-    // State transition
-    always @(posedge clk or posedge rst) begin
+    // Main state machine
+    always @(posedge clk) begin
         if (rst) begin
             state <= IDLE;
+            move_executed <= 0;
+            invalid_move <= 0;
+            move_in_progress <= 0;
+            lifted_piece <= EMPTY;
+            start_row <= 0;
+            start_col <= 0;
+            end_row <= 0;
+            end_col <= 0;
+            orig_row <= 0;
+            orig_col <= 0;
+            new_board <= board; // Copy initial board state
+            scan_idx <= 0;
+            i <= 0;
         end else begin
-            state <= next_state;
-        end
-    end
-
-    // FSM logic
-    always @(*) begin
-        next_state = state;
-        case (state)
-            IDLE: begin
-                for (r = 0; r < 8; r = r + 1) begin
-                    for (c = 0; c < 8; c = c + 1) begin
-                        if (prev_sensor_state[get_flat_index(r, c)] == 1 && sensor_state[get_flat_index(r, c)] == 0) begin
-                            next_state = LIFTED;
-                        end
-                    end
-                end
-            end
-            LIFTED: begin
-                for (r = 0; r < 8; r = r + 1) begin
-                    for (c = 0; c < 8; c = c + 1) begin
-                        if (prev_sensor_state[get_flat_index(r, c)] == 0 && sensor_state[get_flat_index(r, c)] == 1 && 
-                            !(r == input_row && c == input_col)) begin
-                            next_state = PLACED;
-                        end
-                    end
-                end
-            end
-            PLACED: begin
-                next_state = UPDATE;
-            end
-            UPDATE: begin
-                next_state = IDLE;
-            end
-            default: next_state = IDLE;
-        endcase
-    end
-
-    // Main process
-    always @(posedge clk or posedge rst) begin
-        if (rst) begin
-            board_flat_out <= 0;
-            move_valid <= 0;
-            next_turn <= 0;
-            target_row <= 0;
-            target_col <= 0;
-            input_row <= 0;
-            input_col <= 0;
-            lifted_piece <= 0;
-            is_white_turn <= 1;
-            prev_sensor_state <= 0;
-            move_count <= 0;
-            promotion_detected <= 0;
-            for (i = 0; i < 56; i = i + 1) begin
-                moves[i] <= 0;
-            end
-        end else begin
-            // Update previous sensor state
-            prev_sensor_state <= sensor_state;
-
-            // Unpack board_flat_in
-            for (i = 0; i < 64; i = i + 1) begin
-                board_in[i] = board_flat_in[i*4+:4];
-            end
+            // Default outputs
+            move_executed <= 0;
+            invalid_move <= invalid_move; // Maintain unless changed
 
             case (state)
                 IDLE: begin
-                    move_valid <= 0;
-                    next_turn <= 0;
-                    for (r = 0; r < 8; r = r + 1) begin
-                        for (c = 0; c < 8; c = c + 1) begin
-                            if (prev_sensor_state[get_flat_index(r, c)] == 1 && sensor_state[get_flat_index(r, c)] == 0) begin
-                                input_row <= r;
-                                input_col <= c;
-                                lifted_piece <= board_in[get_flat_index(r, c)];
-                                is_white_piece <= (board_in[get_flat_index(r, c)][3] == 0) && (board_in[get_flat_index(r, c)] != 0);
-                            end
-                        end
+                    if (!move_in_progress) begin
+                        state <= DETECT_LIFT;
+                        scan_idx <= 0;
                     end
                 end
 
-                LIFTED: begin
-                    // Skip if lifted piece is invalid
-                    if (lifted_piece == EMPTY) begin
-                        next_state = IDLE;
+                DETECT_LIFT: begin
+                    state <= DETECT_LIFT_SCAN;
+                    scan_idx <= 0;
+                end
+
+                DETECT_LIFT_SCAN: begin
+                    if (scan_idx < 64) begin
+                        if (prev_sensor_state[scan_idx] && !sensor_state[scan_idx]) begin
+                            // Check if there's a piece
+                            if (board[scan_idx*4 +: 4] != EMPTY) begin
+                                // Check if piece matches the turn
+                                if ((white_turn && board[scan_idx*4 + 3] == 0) ||
+                                    (!white_turn && board[scan_idx*4 + 3] == 1)) begin
+                                    // Valid piece: proceed to placement
+                                    lifted_piece <= board[scan_idx*4 +: 4];
+                                    start_row <= scan_idx[5:3];
+                                    start_col <= scan_idx[2:0];
+                                    orig_row <= scan_idx[5:3];
+                                    orig_col <= scan_idx[2:0];
+                                    move_in_progress <= 1;
+                                    invalid_move <= 0;
+                                    state <= WAIT_PLACEMENT;
+                                end else begin
+                                    // Opponent's piece: signal invalid move
+                                    lifted_piece <= board[scan_idx*4 +: 4];
+                                    orig_row <= scan_idx[5:3];
+                                    orig_col <= scan_idx[2:0];
+                                    invalid_move <= 1;
+                                    move_in_progress <= 0;
+                                    state <= INVALID_WAIT;
+                                end
+                            end
+                        end
+                        scan_idx <= scan_idx + 1;
                     end else begin
+                        state <= DETECT_LIFT;
+                    end
+                end
+
+                WAIT_PLACEMENT: begin
+                    state <= WAIT_PLACEMENT_SCAN;
+                    scan_idx <= 0;
+                end
+
+                WAIT_PLACEMENT_SCAN: begin
+                    if (scan_idx == orig_row * 8 + orig_col && sensor_state[scan_idx] == 1) begin
+                        // Piece returned to original position, restart scan
+                        state <= WAIT_PLACEMENT;
+                    end else if (scan_idx < 64) begin
+                        if ((scan_idx[5:3] != start_row || scan_idx[2:0] != start_col) &&
+                            ((!prev_sensor_state[scan_idx] && sensor_state[scan_idx]) || // Non-capture
+                             (prev_sensor_state[scan_idx] && sensor_state[scan_idx]))) begin // Capture
+                            end_row <= scan_idx[5:3];
+                            end_col <= scan_idx[2:0];
+                            state <= VALIDATE_MOVE;
+                        end
+                        scan_idx <= scan_idx + 1;
+                    end else begin
+                        state <= WAIT_PLACEMENT;
+                    end
+                end
+
+                VALIDATE_MOVE: begin
+                    valid_move = 0;
+                    i = end_row * 8 + end_col; // Fixed by declaring 'i' as reg
+
+                    // Basic checks: different position, destination empty or opponent
+                    if (start_row != end_row || start_col != end_col) begin
+                        if ((white_turn && (board[i*4 +: 4] == EMPTY || (board[i*4 + 3] == 1 && board[i*4 +: 4] != EMPTY))) ||
+                            (!white_turn && (board[i*4 +: 4] == EMPTY || (board[i*4 + 3] == 0 && board[i*4 +: 4] != EMPTY)))) begin
+                            // Piece-specific move validation
+                            case (lifted_piece)
+                                W_PAWN, B_PAWN: valid_move = validate_pawn_move(1'b0);
+                                W_ROOK, B_ROOK: valid_move = validate_rook_move(1'b0);
+                                W_KNIGHT, B_KNIGHT: valid_move = validate_knight_move(1'b0);
+                                W_BISHOP, B_BISHOP: valid_move = validate_bishop_move(1'b0);
+                                W_QUEEN, B_QUEEN: valid_move = validate_queen_move(1'b0);
+                                W_KING, B_KING: valid_move = validate_king_move(1'b0);
+                                default: valid_move = 0;
+                            endcase
+                        end
+                    end
+
+                    if (valid_move) begin
+                        // Create updated board with the executed move
+                        new_board = board;
+                        new_board[end_row * 8 * 4 + end_col * 4 +: 4] = lifted_piece;
+                        new_board[start_row * 8 * 4 + start_col * 4 +: 4] = EMPTY;
                         
-                        move_count <= 0;
-                        promotion_detected <= 0;
-                        for (i = 0; i < 56; i = i + 1) begin
-                            moves[i] <= 0;
-                        end
-
-                        // Copy input position
-                        row = input_row;
-                        col = input_col;
-                        piece = lifted_piece;
-                        is_white = is_white_piece;
-
-                        case (piece)
-                            W_PAWN: begin
-                                if (row < 7 && board_in[get_flat_index(row + 1, col)] == EMPTY) begin
-                                    if (move_count < 28) begin
-                                        moves[move_count * 2] <= row + 1;
-                                        moves[move_count * 2 + 1] <= col;
-                                        if (row + 1 == 7) promotion_detected <= 1;
-                                        move_count <= move_count + 1;
-                                    end
-                                    if (row == 1 && board_in[get_flat_index(row + 2, col)] == EMPTY) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row + 2;
-                                            moves[move_count * 2 + 1] <= col;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                                if (row < 7 && col > 0) begin
-                                    target_piece = board_in[get_flat_index(row + 1, col - 1)];
-                                    if (target_piece != EMPTY && target_piece[3] == 1) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row + 1;
-                                            moves[move_count * 2 + 1] <= col - 1;
-                                            if (row + 1 == 7) promotion_detected <= 1;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                                if (row < 7 && col < 7) begin
-                                    target_piece = board_in[get_flat_index(row + 1, col + 1)];
-                                    if (target_piece != EMPTY && target_piece[3] == 1) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row + 1;
-                                            moves[move_count * 2 + 1] <= col + 1;
-                                            if (row + 1 == 7) promotion_detected <= 1;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                            end
-
-                            B_PAWN: begin
-                                if (row > 0 && board_in[get_flat_index(row - 1, col)] == EMPTY) begin
-                                    if (move_count < 28) begin
-                                        moves[move_count * 2] <= row - 1;
-                                        moves[move_count * 2 + 1] <= col;
-                                        if (row - 1 == 0) promotion_detected <= 1;
-                                        move_count <= move_count + 1;
-                                    end
-                                    if (row == 6 && board_in[get_flat_index(row - 2, col)] == EMPTY) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row - 2;
-                                            moves[move_count * 2 + 1] <= col;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                                if (row > 0 && col > 0) begin
-                                    target_piece = board_in[get_flat_index(row - 1, col - 1)];
-                                    if (target_piece != EMPTY && target_piece[3] == 0) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row - 1;
-                                            moves[move_count * 2 + 1] <= col - 1;
-                                            if (row - 1 == 0) promotion_detected <= 1;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                                if (row > 0 && col < 7) begin
-                                    target_piece = board_in[get_flat_index(row - 1, col + 1)];
-                                    if (target_piece != EMPTY && target_piece[3] == 0) begin
-                                        if (move_count < 28) begin
-                                            moves[move_count * 2] <= row - 1;
-                                            moves[move_count * 2 + 1] <= col + 1;
-                                            if (row - 1 == 0) promotion_detected <= 1;
-                                            move_count <= move_count + 1;
-                                        end
-                                    end
-                                end
-                            end
-
-                            W_ROOK, B_ROOK: begin
-                                for (d = 0; d < 4; d = d + 1) begin
-                                    for (step = 1; step < 8; step = step + 1) begin
-                                        new_row = row + step * directions[d][0];
-                                        new_col = col + step * directions[d][1];
-                                        if (new_row >= 8 || new_col >= 8 || new_row < 0 || new_col < 0 || move_count >= 28) begin
-                                            step = 8;
-                                        end else begin
-                                            target_piece = board_in[get_flat_index(new_row, new_col)];
-                                            if (target_piece == EMPTY) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end else begin
-                                                if (is_white && target_piece[3] == 1) begin
-                                                    moves[move_count * 2] <= new_row;
-                                                    moves[move_count * 2 + 1] <= new_col;
-                                                    move_count <= move_count + 1;
-                                                end else if (!is_white && target_piece[3] == 0 && target_piece != EMPTY) begin
-                                                    moves[move_count * 2] <= new_row;
-                                                    moves[move_count * 2 + 1] <= new_col;
-                                                    move_count <= move_count + 1;
-                                                end
-                                                step = 8;
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-
-                            W_BISHOP, B_BISHOP: begin
-                                for (d = 4; d < 8; d = d + 1) begin
-                                    for (step = 1; step < 8; step = step + 1) begin
-                                        new_row = row + step * directions[d][0];
-                                        new_col = col + step * directions[d][1];
-                                        if (new_row >= 8 || new_col >= 8 || new_row < 0 || new_col < 0 || move_count >= 28) begin
-                                            step = 8;
-                                        end else begin
-                                            target_piece = board_in[get_flat_index(new_row, new_col)];
-                                            if (target_piece == EMPTY) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end else if ((is_white && target_piece[3] == 1) || (!is_white && target_piece[3] == 0 && target_piece != EMPTY)) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                                step = 8;
-                                            end else begin
-                                                step = 8;
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-
-                            W_QUEEN, B_QUEEN: begin
-                                for (d = 0; d < 8; d = d + 1) begin
-                                    for (step = 1; step < 8; step = step + 1) begin
-                                        new_row = row + step * directions[d][0];
-                                        new_col = col + step * directions[d][1];
-                                        if (new_row >= 8 || new_col >= 8 || new_row < 0 || new_col < 0 || move_count >= 28) begin
-                                            step = 8;
-                                        end else begin
-                                            target_piece = board_in[get_flat_index(new_row, new_col)];
-                                            if (target_piece == EMPTY) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end else if ((is_white && target_piece[3] == 1) || (!is_white && target_piece[3] == 0 && target_piece != EMPTY)) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                                step = 8;
-                                            end else begin
-                                                step = 8;
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-
-                            W_KNIGHT, B_KNIGHT: begin
-                                for (i = 0; i < 8; i = i + 1) begin
-                                    new_row = row + knight_moves[i][0];
-                                    new_col = col + knight_moves[i][1];
-                                    if (new_row >= 0 && new_row < 8 && new_col >= 0 && new_col < 8) begin
-                                        if (move_count < 28) begin
-                                            target_piece = board_in[get_flat_index(new_row, new_col)];
-                                            if (target_piece == EMPTY) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end else if ((is_white && target_piece[3] == 1) || (!is_white && target_piece[3] == 0 && target_piece != EMPTY)) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-
-                            W_KING, B_KING: begin
-                                for (i = 0; i < 8; i = i + 1) begin
-                                    new_row = row + king_moves[i][0];
-                                    new_col = col + king_moves[i][1];
-                                    if (new_row >= 0 && new_row < 8 && new_col >= 0 && new_col < 8) begin
-                                        if (move_count < 28) begin
-                                            target_piece = board_in[get_flat_index(new_row, new_col)];
-                                            if (target_piece == EMPTY) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end else if ((is_white && target_piece[3] == 1) || (!is_white && target_piece[3] == 0 && target_piece != EMPTY)) begin
-                                                moves[move_count * 2] <= new_row;
-                                                moves[move_count * 2 + 1] <= new_col;
-                                                move_count <= move_count + 1;
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-
-                            default: begin
-                                move_count <= 0;
-                            end
-                        endcase
-                    end
-                end
-
-                PLACED: begin
-                    move_valid <= 0;
-                    for (r = 0; r < 8; r = r + 1) begin
-                        for (c = 0; c < 8; c = c + 1) begin
-                            if (prev_sensor_state[get_flat_index(r, c)] == 0 && sensor_state[get_flat_index(r, c)] == 1 && 
-                                !(r == input_row && c == input_col)) begin
-                                target_row <= r;
-                                target_col <= c;
-                            end
-                        end
-                    end
-                    
-                    for (i = 0; i < move_count; i = i + 1) begin
-                        if (moves[i*2] == target_row && moves[i*2+1] == target_col && is_white_turn == is_white_piece) begin
-                            move_valid <= 1;
-                            break;
-                        end
-                    end
-                end
-
-                UPDATE: begin
-                    if (move_valid) begin
-                        // Update board state
-                        for (i = 0; i < 64; i = i + 1) begin
-                            board_out[i] = board_in[i];
-                        end
-
-                        // Handle promotion
-                        if (promotion_detected && (lifted_piece == W_PAWN || lifted_piece == B_PAWN)) begin
-                            board_out[get_flat_index(target_row, target_col)] = (lifted_piece == W_PAWN) ? W_QUEEN : B_QUEEN;
-                        end else begin
-                            board_out[get_flat_index(target_row, target_col)] = lifted_piece;
-                        end
-                        board_out[get_flat_index(input_row, input_col)] = 0;
-
-                        // Pack board_out into board_flat_out
-                        for (i = 0; i < 64; i = i + 1) begin
-                            board_flat_out[i*4+:4] = board_out[i];
-                        end
-
-                        // Switch turn
-                        is_white_turn <= ~is_white_turn;
-                        next_turn <= 1;
+                        // Register successful move
+                        move_executed <= 1;
+                        move_in_progress <= 0;
+                        invalid_move <= 0;
+                        state <= IDLE;
                     end else begin
-                        // Revert to previous state on invalid move
-                        for (i = 0; i < 64; i = i + 1) begin
-                            board_flat_out[i*4+:4] = board_in[i];
-                        end
-                    end
-
-                    // Reset flags
-                    move_count <= 0;
-                    promotion_detected <= 0;
-                end
-
-                default: begin
-                    move_valid <= 0;
-                    next_turn <= 0;
-                    for (i = 0; i < 64; i = i + 1) begin
-                        board_flat_out[i*4+:4] = board_in[i];
+                        // Invalid move - wait for piece to return
+                        invalid_move <= 1;
+                        state <= INVALID_WAIT;
                     end
                 end
+
+                INVALID_WAIT: begin
+                    i = orig_row * 8 + orig_col;
+                    if (sensor_state[i]) begin
+                        invalid_move <= 0;
+                        move_in_progress <= 0;
+                        lifted_piece <= EMPTY;
+                        state <= IDLE;
+                    end
+                end
+
+                default: state <= IDLE;
             endcase
         end
     end
+
+function validate_pawn_move(input reg dummy);
+    reg [3:0] delta_row;
+    reg [3:0] delta_col;
+    reg valid;
+    reg [5:0] end_idx, mid_idx;
+    begin
+        end_idx = end_row * 8 + end_col;
+        valid = 0;
+        
+        // Direction dependent on color
+        if (white_turn) begin
+            // White pawn moves
+            if (lifted_piece == W_PAWN) begin
+                // Calculate delta - how far the pawn is moving
+                delta_row = end_row - start_row; // White pawns move up (increasing row)
+                delta_col = (end_col > start_col) ? (end_col - start_col) : (start_col - end_col);
+                
+                // Forward one square (must be to empty square)
+                if (delta_row == 1 && delta_col == 0 && board[end_idx*4 +: 4] == EMPTY) begin
+                    valid = 1;
+                end
+                // Forward two squares from initial rank (must be to empty square with clear path)
+                else if (start_row == 1 && delta_row == 2 && delta_col == 0 && 
+                         board[end_idx*4 +: 4] == EMPTY) begin
+                    mid_idx = (start_row + 1) * 8 + start_col;
+                    if (board[mid_idx*4 +: 4] == EMPTY) begin
+                        valid = 1;
+                    end
+                end
+                // Diagonal capture - must capture opponent's piece
+                else if (delta_row == 1 && delta_col == 1) begin
+                    // Check for black pieces to capture (MSB will be 1 for black)
+                    if (board[end_idx*4 +: 4] != EMPTY && board[end_idx*4 + 3] == 1) begin
+                        valid = 1;
+                    end
+                    // Note: En passant capture would be added here if implemented
+                end
+            end
+        end else begin
+            // Black pawn moves
+            if (lifted_piece == B_PAWN) begin
+                // Calculate delta - how far the pawn is moving
+                delta_row = start_row - end_row; // Black pawns move down (decreasing row)
+                delta_col = (end_col > start_col) ? (end_col - start_col) : (start_col - end_col);
+                
+                // Forward one square (must be to empty square)
+                if (delta_row == 1 && delta_col == 0 && board[end_idx*4 +: 4] == EMPTY) begin
+                    valid = 1;
+                end
+                // Forward two squares from initial rank (must be to empty square with clear path)
+                else if (start_row == 6 && delta_row == 2 && delta_col == 0 && 
+                         board[end_idx*4 +: 4] == EMPTY) begin
+                    mid_idx = (start_row - 1) * 8 + start_col;
+                    if (board[mid_idx*4 +: 4] == EMPTY) begin
+                        valid = 1;
+                    end
+                end
+                // Diagonal capture - must capture opponent's piece
+                else if (delta_row == 1 && delta_col == 1) begin
+                    // Check for white pieces to capture (MSB will be 0 for white)
+                    if (board[end_idx*4 +: 4] != EMPTY && board[end_idx*4 + 3] == 0) begin
+                        valid = 1;
+                    end
+                    // Note: En passant capture would be added here if implemented
+                end
+            end
+        end
+        
+        validate_pawn_move = valid;
+    end
+endfunction
+
+    // Rook move validation (Loop-free version)
+    function validate_rook_move(input reg dummy);
+        reg valid;
+        reg [5:0] path_idx;
+        reg path_clear;
+        reg [2:0] delta_row, delta_col;
+        begin
+            path_clear = 1;
+            valid = 0;
+
+            // Must move along rank or file
+            delta_row = (start_row > end_row) ? (start_row - end_row) : (end_row - start_row);
+            delta_col = (start_col > end_col) ? (start_col - end_col) : (end_col - start_col);
+            
+            if (delta_row == 0 || delta_col == 0) begin // Moving along row or column
+                if (delta_row == 0) begin // Horizontal move
+                    if (start_col < end_col) begin
+                        // Moving right
+                        if (start_col + 1 < end_col) begin path_idx = start_row * 8 + (start_col + 1); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_col + 2 < end_col) begin path_idx = start_row * 8 + (start_col + 2); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_col + 3 < end_col) begin path_idx = start_row * 8 + (start_col + 3); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_col + 4 < end_col) begin path_idx = start_row * 8 + (start_col + 4); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_col + 5 < end_col) begin path_idx = start_row * 8 + (start_col + 5); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_col + 6 < end_col) begin path_idx = start_row * 8 + (start_col + 6); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                    end else begin
+                        // Moving left
+                        if (end_col + 1 < start_col) begin path_idx = start_row * 8 + (end_col + 1); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_col + 2 < start_col) begin path_idx = start_row * 8 + (end_col + 2); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_col + 3 < start_col) begin path_idx = start_row * 8 + (end_col + 3); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_col + 4 < start_col) begin path_idx = start_row * 8 + (end_col + 4); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_col + 5 < start_col) begin path_idx = start_row * 8 + (end_col + 5); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_col + 6 < start_col) begin path_idx = start_row * 8 + (end_col + 6); if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                    end
+                end else begin // Vertical move
+                    if (start_row < end_row) begin
+                        // Moving down
+                        if (start_row + 1 < end_row) begin path_idx = (start_row + 1) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_row + 2 < end_row) begin path_idx = (start_row + 2) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_row + 3 < end_row) begin path_idx = (start_row + 3) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_row + 4 < end_row) begin path_idx = (start_row + 4) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_row + 5 < end_row) begin path_idx = (start_row + 5) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (start_row + 6 < end_row) begin path_idx = (start_row + 6) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                    end else begin
+                        // Moving up
+                        if (end_row + 1 < start_row) begin path_idx = (end_row + 1) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_row + 2 < start_row) begin path_idx = (end_row + 2) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_row + 3 < start_row) begin path_idx = (end_row + 3) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_row + 4 < start_row) begin path_idx = (end_row + 4) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_row + 5 < start_row) begin path_idx = (end_row + 5) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                        if (end_row + 6 < start_row) begin path_idx = (end_row + 6) * 8 + start_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0; end
+                    end
+                end
+
+                if (path_clear) begin
+                    valid = 1;
+                    // Target square: must be empty or opponent's piece
+                    path_idx = end_row * 8 + end_col;
+                    if (board[path_idx*4 +: 4] != EMPTY) begin
+                        // If target has a piece, it must be opponent's
+                        if ((white_turn && board[path_idx*4 + 3] == 0) || 
+                            (!white_turn && board[path_idx*4 + 3] == 1)) begin
+                            valid = 0; // Can't capture own piece
+                        end
+                    end
+                end
+            end
+            
+            validate_rook_move = valid;
+        end
+    endfunction
+
+    // Knight move validation
+    function validate_knight_move(input reg dummy);
+        reg [3:0] delta_row, delta_col;
+        reg [5:0] end_idx;
+        begin
+            end_idx = end_row * 8 + end_col;
+            delta_row = (end_row > start_row) ? (end_row - start_row) : (start_row - end_row);
+            delta_col = (end_col > start_col) ? (end_col - start_col) : (start_col - end_col);
+            
+            // Knight moves in L-shape: 2+1 pattern
+            validate_knight_move = ((delta_row == 2 && delta_col == 1) || (delta_row == 1 && delta_col == 2));
+            
+            // Target square: must be empty or opponent's piece
+            if (validate_knight_move && board[end_idx*4 +: 4] != EMPTY) begin
+                // If target has a piece, it must be opponent's
+                if ((white_turn && board[end_idx*4 + 3] == 0) || 
+                    (!white_turn && board[end_idx*4 + 3] == 1)) begin
+                    validate_knight_move = 0; // Can't capture own piece
+                end
+            end
+        end
+    endfunction
+
+    // Bishop move validation (Loop-free version)
+    function validate_bishop_move(input reg dummy);
+        reg valid;
+        reg [5:0] path_idx;
+        reg path_clear;
+        reg [2:0] delta_row, delta_col;
+        reg [2:0] row_step, col_step;
+        reg [2:0] check_row, check_col;
+        begin
+            valid = 0;
+            path_clear = 1;
+            delta_row = (end_row > start_row) ? (end_row - start_row) : (start_row - end_row);
+            delta_col = (end_col > start_col) ? (end_col - start_col) : (start_col - end_col);
+            
+            // Bishop moves diagonally (equal steps in row and column)
+            if (delta_row == delta_col) begin
+                row_step = (end_row > start_row) ? 1 : -1;
+                col_step = (end_col > start_col) ? 1 : -1;
+
+                // Check path is clear (unrolled for max 7 steps)
+                check_row = start_row + row_step;
+                check_col = start_col + col_step;
+                if (delta_row > 1) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                    check_row = check_row + row_step; check_col = check_col + col_step;
+                end
+                if (delta_row > 2) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                    check_row = check_row + row_step; check_col = check_col + col_step;
+                end
+                if (delta_row > 3) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                    check_row = check_row + row_step; check_col = check_col + col_step;
+                end
+                if (delta_row > 4) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                    check_row = check_row + row_step; check_col = check_col + col_step;
+                end
+                if (delta_row > 5) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                    check_row = check_row + row_step; check_col = check_col + col_step;
+                end
+                if (delta_row > 6) begin
+                    path_idx = check_row * 8 + check_col; if (board[path_idx*4 +: 4] != EMPTY) path_clear = 0;
+                end
+
+                if (path_clear) begin
+                    valid = 1;
+                    // Target square: must be empty or opponent's piece
+                    path_idx = end_row * 8 + end_col;
+                    if (board[path_idx*4 +: 4] != EMPTY) begin
+                        // If target has a piece, it must be opponent's
+                        if ((white_turn && board[path_idx*4 + 3] == 0) || 
+                            (!white_turn && board[path_idx*4 + 3] == 1)) begin
+                            valid = 0; // Can't capture own piece
+                        end
+                    end
+                end
+            end
+            
+            validate_bishop_move = valid;
+        end
+    endfunction
+
+    // Queen move validation (combines rook and bishop movement)
+    function validate_queen_move(input reg dummy);
+        begin
+            validate_queen_move = (validate_rook_move(dummy) || validate_bishop_move(dummy));
+        end
+    endfunction
+
+    // King move validation
+    function validate_king_move(input reg dummy);
+        reg [3:0] delta_row, delta_col;
+        reg [5:0] end_idx;
+        begin
+            end_idx = end_row * 8 + end_col;
+            delta_row = (end_row > start_row) ? (end_row - start_row) : (start_row - end_row);
+            delta_col = (end_col > start_col) ? (end_col - start_col) : (start_col - end_col);
+            
+            // King moves one square in any direction
+            validate_king_move = (delta_row <= 1 && delta_col <= 1 && (delta_row != 0 || delta_col != 0));
+            
+            // Target square: must be empty or opponent's piece
+            if (validate_king_move && board[end_idx*4 +: 4] != EMPTY) begin
+                // If target has a piece, it must be opponent's
+                if ((white_turn && board[end_idx*4 + 3] == 0) || 
+                    (!white_turn && board[end_idx*4 + 3] == 1)) begin
+                    validate_king_move = 0; // Can't capture own piece
+                end
+            end
+        end
+    endfunction
+
 endmodule
